@@ -1,0 +1,1053 @@
+from OpenGL.GL import *
+from OpenGL.GLUT import *
+from OpenGL.GLU import *
+import random, math, json, os
+
+# --------------- Window / camera / scene ---------------
+
+WINDOW_W, WINDOW_H = 1000, 800
+ASPECT = WINDOW_W / float(WINDOW_H)
+
+GRID_LENGTH = 1000
+TILE_SIZE = 120
+
+# --------------- Side wall placement & look ---------------
+
+WALL_INSET = 150
+WALL_HEIGHT = 150
+WALL_COLOR_BASE = (0.20, 0.20, 0.22)
+
+FOVY = 100
+
+# --------------- Player and Enemy Scaling ---------------
+
+PLAYER_SCALE = 3.0
+ENEMY_SCALE = 2.0
+
+# --------------- Game Constants ---------------
+
+LEVEL_DISTANCE = 800
+COLLECTIBLE_SPAWN_RATE = 1
+OBSTACLE_SPAWN_RATE = 0.25
+
+# --------------- Day/Night Changing pattern ---------------
+
+DAYNIGHT_SPEED = 0.05
+_daynight_phase = 0.0
+animation_counter = 0  # Replace glutGet(GLUT_ELAPSED_TIME)
+
+# --------------- Global movement state for smooth movement ---------------
+current_movement = {'left': 0, 'right': 0, 'forward': 0, 'backward': 0}
+
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+def _mix_color(c1, c2, t):
+    return (_lerp(c1[0], c2[0], t), _lerp(c1[1], c2[1], t), _lerp(c1[2], c2[2], t))
+
+def update_daynight(dt):
+    global _daynight_phase
+    _daynight_phase = (_daynight_phase + dt * DAYNIGHT_SPEED * 2.0 * math.pi) % (2.0 * math.pi)
+
+def get_day_brightness():
+    base = 0.5 * (1.0 + math.cos(_daynight_phase - math.pi))
+    return 0.35 + 0.65 * base
+
+def get_sky_color():
+    t = 0.5 * (1.0 + math.cos(_daynight_phase))
+    day = (0.32, 0.65, 0.95)
+    dusk = (0.55, 0.25, 0.55)
+    night = (0.05, 0.07, 0.15)
+    dawn = (0.95, 0.55, 0.25)
+    if t > 0.66:
+        u = (t - 0.66) / 0.34
+        return _mix_color(day, dusk, u)
+    elif t > 0.33:
+        u = (t - 0.33) / 0.33
+        return _mix_color(dawn, day, u)
+    else:
+        u = t / 0.33
+        return _mix_color(night, dawn, u)
+
+# --------------- Boss System (FIXED) ---------------
+BOSS_LEVEL_INTERVAL = 3
+BOSS_BASE_HEALTH = 5
+boss = None
+boss_spawned_levels = set()
+
+# --------------- Combo / Multiplier System ---------------
+COMBO_WINDOW = 4.0
+COMBO_STEP = 5
+MAX_MULTIPLIER = 5.0
+combo_count = 0
+combo_timer = 0.0
+score_multiplier = 1.0
+best_combo = 0
+
+# --------------- Game state ---------------
+_quad = None
+_last_time_ms = None
+enemies = []
+obstacles = []
+collectibles = []
+game_state = 'menu'
+selected_player = 0
+scoreboard = []
+
+# --------------- Player abilities cooldowns ---------------
+ability_cooldowns = {
+    'high_jump': 0,
+    'speed_burst': 0,
+    'invincibility': 0,
+    'freeze': 0,
+    'movement': 0
+}
+ability_uses = {key: 0 for key in ability_cooldowns}
+
+# --------------- Power-up effects ---------------
+power_effects = {
+    'immune_time': 0,
+    'double_score_time': 0,
+    'freeze_time': 0,
+    'speed_time': 0,
+    'invincible_time': 0
+}
+
+# --------------- Player types ---------------
+PLAYER_TYPES = [
+    {'name': 'JUMPER',     'color': (0.0, 0.8, 0.0), 'jump_power': 600, 'special': 'high_jump'},
+    {'name': 'SPEEDSTER',  'color': (0.0, 0.0, 1.0), 'jump_power': 450, 'special': 'speed_burst'},
+    {'name': 'TANK',       'color': (1.0, 0.5, 0.0), 'jump_power': 400, 'special': 'invincibility'},
+    {'name': 'CONTROLLER', 'color': (0.8, 0.0, 0.8), 'jump_power': 450, 'special': 'freeze'}
+]
+
+# --------------- Player class ---------------
+class Player:
+    def __init__(self):
+        self.x = 0.0
+        self.y = -GRID_LENGTH + 120.0
+        self.z = 0.0
+        self.vz = 0.0
+        self.speed_forward = 200.0
+        self.speed_side = 300.0
+        self.speed_manual = 200.0
+        self.gravity = -1200.0
+        self.scale = PLAYER_SCALE
+        self.radius = 25.0 * self.scale
+        self.height = 50.0 * self.scale
+
+        # Game stats
+        self.lives = 3
+        self.health = 100
+        self.score = 0
+        self.level = 1
+        self.distance = 0
+        self.consecutive_collect = {'type': None, 'count': 0}
+
+        # --------------- Movement flags - REMOVED for template compatibility ---------------
+        self.on_ground = True
+
+    def get_type(self):
+        return PLAYER_TYPES[selected_player]
+
+    def use_ability(self):
+        ptype = self.get_type()
+        ability = ptype['special']
+
+        if ability_uses[ability] >= 2:
+            return False
+
+        if ability_cooldowns[ability] > 0:
+            return False
+
+        ability_uses[ability] += 1
+        ability_cooldowns[ability] = 5.0
+
+        for key in ability_uses:
+            if key != ability:
+                ability_uses[key] = 0
+
+        if ability == 'high_jump':
+            self.vz = 800
+            self.on_ground = False
+        elif ability == 'speed_burst':
+            power_effects['speed_time'] = 3.0
+        elif ability == 'invincibility':
+            power_effects['invincible_time'] = 4.0
+        elif ability == 'freeze':
+            power_effects['freeze_time'] = 3.0
+
+        return True
+
+player = Player()
+
+# --------------- Smooth movement function ---------------
+def update_smooth_movement_simple(dt):
+    """Simple smooth movement with auto-decay"""
+    global current_movement
+    
+    # --------------- Decay movement counters ---------------
+    for direction in current_movement:
+        if current_movement[direction] > 0:
+            current_movement[direction] -= 1
+    
+    # --------------- Apply smooth movement based on active directions ---------------
+    move_speed = 200.0 * dt
+    
+    if current_movement['left'] > 0:
+        player.x -= move_speed
+    if current_movement['right'] > 0:
+        player.x += move_speed
+    if current_movement['forward'] > 0:
+        player.y += move_speed
+    if current_movement['backward'] > 0:
+        player.y -= move_speed
+
+# --------------- Helpers ---------------
+def ensure_quad():
+    global _quad
+    if _quad is None:
+        _quad = gluNewQuadric()
+
+def clamp(v, lo, hi): 
+    return max(lo, min(hi, v))
+
+def distance_2d(x1, y1, x2, y2):
+    return math.sqrt((x1-x2)**2 + (y1-y2)**2)
+
+# --------------- Scoreboard management ---------------
+def load_scoreboard():
+    global scoreboard
+    try:
+        if os.path.exists('scoreboard.json'):
+            with open('scoreboard.json', 'r') as f:
+                scoreboard = json.load(f)
+        else:
+            scoreboard = []
+    except:
+        scoreboard = []
+
+def save_scoreboard():
+    try:
+        with open('scoreboard.json', 'w') as f:
+            json.dump(scoreboard, f)
+    except:
+        pass
+
+def add_score_to_board(score):
+    global scoreboard
+    scoreboard.append(score)
+    scoreboard.sort(reverse=True)
+    scoreboard = scoreboard[:10]
+    save_scoreboard()
+
+def get_player_rank(score):
+    for i, s in enumerate(scoreboard):
+        if score >= s:
+            return i + 1
+    return len(scoreboard) + 1
+
+# --------------- Infinite checkerboard with day/night tint ---------------
+def draw_tiles_infinite():
+    back_len, front_len = 1200.0, 4000.0
+    y0 = player.y - back_len
+    y1 = player.y + front_len
+    j0 = int(math.floor(y0 / TILE_SIZE))
+    j1 = int(math.floor(y1 / TILE_SIZE) + 1)
+    i0 = int(math.floor(-GRID_LENGTH / TILE_SIZE))
+    i1 = int(math.floor( GRID_LENGTH / TILE_SIZE) + 1)
+
+    brightness = get_day_brightness()
+    c1 = (0.92 * brightness, 0.92 * brightness, 0.96 * brightness)
+    c2 = (0.72 * brightness, 0.62 * brightness, 0.92 * brightness)
+
+    for j in range(j0, j1):
+        ty0, ty1 = j * TILE_SIZE, j * TILE_SIZE + TILE_SIZE
+        for i in range(i0, i1):
+            tx0, tx1 = i * TILE_SIZE, i * TILE_SIZE + TILE_SIZE
+            glColor3f(*(c1 if ((i + j) & 1) == 0 else c2))
+            glBegin(GL_QUADS)
+            glVertex3f(tx0, ty0, 0)
+            glVertex3f(tx1, ty0, 0)
+            glVertex3f(tx1, ty1, 0)
+            glVertex3f(tx0, ty1, 0)
+            glEnd()
+
+# --------------- Side walls (tinted by day/night) ---------------
+def draw_side_walls_infinite():
+    left_x  = -GRID_LENGTH + WALL_INSET
+    right_x =  GRID_LENGTH - WALL_INSET
+    back_len, front_len = 1200.0, 4000.0
+    y0 = math.floor((player.y - back_len) / TILE_SIZE) * TILE_SIZE
+    y1 = math.floor((player.y + front_len) / TILE_SIZE + 1) * TILE_SIZE
+
+    b = 0.6 + 0.4 * get_day_brightness()
+    wall_color = (WALL_COLOR_BASE[0]*b, WALL_COLOR_BASE[1]*b, WALL_COLOR_BASE[2]*b)
+    glColor3f(*wall_color)
+
+    # --------------- Left wall ---------------
+    glBegin(GL_QUADS)
+    glVertex3f(left_x, y0, 0)
+    glVertex3f(left_x, y1, 0)
+    glVertex3f(left_x, y1, WALL_HEIGHT)
+    glVertex3f(left_x, y0, WALL_HEIGHT)
+    glEnd()
+
+    # --------------- Right wall ---------------
+    glBegin(GL_QUADS)
+    glVertex3f(right_x, y0, 0)
+    glVertex3f(right_x, y1, 0)
+    glVertex3f(right_x, y1, WALL_HEIGHT)
+    glVertex3f(right_x, y0, WALL_HEIGHT)
+    glEnd()
+
+def clamp_to_walls():
+    left_x = -GRID_LENGTH + WALL_INSET
+    right_x = GRID_LENGTH - WALL_INSET
+    margin = 100.0
+    player.x = clamp(player.x, left_x + margin, right_x - margin)
+
+# --------------- Global camera state ---------------
+camera_pos = [0.0, -500.0, 400.0]
+camera_look = [0.0, 0.0, 80.0]
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def setupCamera():
+    global camera_pos, camera_look
+
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(FOVY, ASPECT, 0.1, 6000.0)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+
+    s = player.scale
+
+    target_x = player.x
+    target_y = player.y - 300 * s
+    target_z = player.z + 250 * s
+
+    look_x = player.x
+    look_y = player.y + 200 * s
+    look_z = max(30.0 * s, player.z + 50.0 * s)
+
+    smooth = 0.1
+    camera_pos[0] = lerp(camera_pos[0], target_x, smooth)
+    camera_pos[1] = lerp(camera_pos[1], target_y, smooth)
+    camera_pos[2] = lerp(camera_pos[2], target_z, smooth)
+
+    camera_look[0] = lerp(camera_look[0], look_x, smooth)
+    camera_look[1] = lerp(camera_look[1], look_y, smooth)
+    camera_look[2] = lerp(camera_look[2], look_z, smooth)
+
+    sway = (player.x - camera_pos[0]) * 0.05
+    camera_pos[0] += sway
+    camera_look[0] += sway * 0.5
+
+    gluLookAt(camera_pos[0], camera_pos[1], camera_pos[2],
+              camera_look[0], camera_look[1], camera_look[2],
+              0, 0, 1)
+
+# --------------- Player drawing ---------------
+def draw_player():
+    ensure_quad()
+    ptype = player.get_type()
+
+    # --------------- Removed transparency effect - use only glColor3f ---------------
+    if power_effects['invincible_time'] > 0:
+        # Simple blinking effect without alpha
+        if (animation_counter // 10) % 2 == 0:
+            glColor3f(ptype['color'][0], ptype['color'][1], ptype['color'][2])
+        else:
+            glColor3f(1.0, 1.0, 1.0)  # White blink
+    else:
+        glColor3f(*ptype['color'])
+
+    glPushMatrix()
+    glTranslatef(player.x, player.y, player.z + 15)
+    glScalef(player.scale, player.scale, player.scale)
+
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(_quad, 20, 20, 40, 16, 16)
+    glPopMatrix()
+
+    glPushMatrix()
+    glTranslatef(0, 0, 25)
+    glColor3f(0.0, 0.0, 0.0)
+    gluSphere(_quad, 15, 16, 16)
+    glPopMatrix()
+
+    glPopMatrix()
+
+# --------------- 2D overlay helpers (HUD) - simplified ---------------
+def begin_2d():
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    gluOrtho2D(0, WINDOW_W, 0, WINDOW_H)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+def end_2d():
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+def draw_text(x, y, text, font=GLUT_BITMAP_HELVETICA_18):
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(font, ord(ch))
+
+def draw_rect(x0, y0, x1, y1):
+    glBegin(GL_QUADS)
+    glVertex2f(x0, y0)
+    glVertex2f(x1, y0)
+    glVertex2f(x1, y1)
+    glVertex2f(x0, y1)
+    glEnd()
+
+# --------------- Simplified circle using quads ---------------
+def draw_circle(cx, cy, r, segments=8):
+    glBegin(GL_QUADS)
+    for i in range(segments):
+        a1 = 2.0 * math.pi * i / segments
+        a2 = 2.0 * math.pi * (i + 1) / segments
+        glVertex2f(cx + math.cos(a1) * r, cy + math.sin(a1) * r)
+        glVertex2f(cx + math.cos(a2) * r, cy + math.sin(a2) * r)
+        glVertex2f(cx + math.cos(a2) * r * 0.8, cy + math.sin(a2) * r * 0.8)
+        glVertex2f(cx + math.cos(a1) * r * 0.8, cy + math.sin(a1) * r * 0.8)
+    glEnd()
+
+def draw_lives(x, y, count):
+    spacing = 28
+    r = 10
+    for i in range(count):
+        glColor3f(0.9, 0.1, 0.1)
+        draw_circle(x + i * spacing, y, r, segments=8)
+        glColor3f(1.0, 1.0, 1.0)
+        draw_circle(x + i * spacing - 3, y + 4, 3, segments=6)
+
+# --------------- Enemies (and Boss) ---------------
+def get_enemy_spawn_positions():
+    return [
+        (-400, player.y - 500),
+        (-200, player.y - 450),
+        (0,    player.y - 600),
+        (200,  player.y - 450),
+        (400,  player.y - 500),
+    ]
+
+def spawn_enemy(position_index):
+    base_speed = 120.0 + (player.level * 30)
+    positions = get_enemy_spawn_positions()
+    pos = positions[position_index % len(positions)]
+    return {
+        'x': pos[0],
+        'y': pos[1],
+        'z': 15.0,
+        'r': 15.0,
+        'speed': base_speed,
+        'health': 1,
+        'id': position_index,
+        'boss': False
+    }
+
+def spawn_boss():
+    global boss
+    normal_enemy_speed = 120.0 + (player.level * 30)
+    boss_speed = normal_enemy_speed + 50.0
+    
+    boss = {
+        'x': 0.0,
+        'y': player.y + 300.0,
+        'z': 30.0,
+        'r': 35.0,
+        'speed': boss_speed,
+        'health': BOSS_BASE_HEALTH + max(0, player.level - 1),
+        'rage': 0.0,
+        'boss': True
+    }
+    enemies.append(boss)
+    boss_spawned_levels.add(player.level)
+
+def draw_enemy(e):
+    ensure_quad()
+    glPushMatrix()
+    glTranslatef(e['x'], e['y'], e['z'])
+    scale = 1.6 * ENEMY_SCALE if e.get('boss') else ENEMY_SCALE
+    glScalef(scale, scale, scale)
+
+    if e.get('boss'):
+        t = 0.5 + 0.5 * math.sin(animation_counter * 0.005)
+        glColor3f(0.7 + 0.3*t, 0.1, 0.8 - 0.3*t)
+        gluSphere(_quad, e['r'], 24, 24)
+        glPushMatrix()
+        glTranslatef(0,0,e['r']*0.9)
+        glColor3f(1.0, 0.85, 0.2)
+        # Replace glutSolidTorus with gluSphere
+        gluSphere(_quad, 8, 8, 8)
+        glPopMatrix()
+    else:
+        glColor3f(1.0, 0.2, 0.2)
+        gluSphere(_quad, e['r'], 16, 16)
+
+    glPushMatrix()
+    glTranslatef(0, 0, e['r'] * 0.8)
+    glColor3f(0.0, 0.0, 0.0)
+    gluSphere(_quad, e['r'] * 0.5, 12, 12)
+    glPopMatrix()
+
+    glPopMatrix()
+
+def update_enemy(e, dt):
+    if power_effects['freeze_time'] > 0:
+        return
+
+    vx = player.x - e['x']
+    vy = player.y - e['y']
+    length = math.sqrt(vx * vx + vy * vy)
+    
+    if length > 0:
+        vx /= length
+        vy /= length
+        speed = e['speed']
+        
+        if e.get('boss'):
+            e['rage'] = (e['rage'] + dt) % 2.0
+        
+        e['x'] += vx * speed * dt
+        e['y'] += vy * speed * dt
+
+    e['z'] = 30.0 if e.get('boss') else 15.0
+    
+    left_x = -GRID_LENGTH + WALL_INSET + 100
+    right_x = GRID_LENGTH - WALL_INSET - 100
+    e['x'] = clamp(e['x'], left_x, right_x)
+
+def manage_enemies(dt):
+    global enemies, boss
+    
+    enemies = [e for e in enemies if distance_2d(player.x, player.y, e['x'], e['y']) < 1400]
+    
+    boss_enemies = [e for e in enemies if e.get('boss')]
+    if boss_enemies:
+        boss = boss_enemies[0]
+    else:
+        boss = None
+    
+    if (player.level > 0 and 
+        player.level % BOSS_LEVEL_INTERVAL == 0 and 
+        player.level not in boss_spawned_levels):
+        spawn_boss()
+    
+    target_enemies = 5 + (player.level - 1) * 2
+    target_enemies = min(target_enemies, 15)
+    
+    if boss is not None:
+        target_enemies = max(2, int(target_enemies * 0.6))
+    
+    current_normal_enemies = len([e for e in enemies if not e.get('boss')])
+    while current_normal_enemies < target_enemies:
+        position_index = len(enemies) % 5
+        enemies.append(spawn_enemy(position_index))
+        current_normal_enemies += 1
+
+# --------------- Obstacles ---------------
+def spawn_obstacle():
+    obs_type = random.choice(['wall', 'spinner'])
+    return {
+        'type': obs_type,
+        'x': random.uniform(-GRID_LENGTH + WALL_INSET + 150, GRID_LENGTH - WALL_INSET - 150),
+        'y': player.y + random.uniform(400, 1000),
+        'z': 0,
+        'rotation': 0
+    }
+
+def draw_obstacle(obs):
+    ensure_quad()
+    glPushMatrix()
+    glTranslatef(obs['x'], obs['y'], obs['z'])
+
+    if obs['type'] == 'wall':
+        b = 0.7 + 0.3 * get_day_brightness()
+        glColor3f(0.6*b, 0.6*b, 0.6*b)
+        glPushMatrix()
+        glScalef(80, 80, 160)
+        glutSolidCube(1)
+        glPopMatrix()
+    elif obs['type'] == 'spinner':
+        b = 0.8 + 0.2 * get_day_brightness()
+        glColor3f(0.9*b, 0.1*b, 0.1*b)
+        glPushMatrix()
+        glRotatef(obs['rotation'], 0, 0, 1)
+        glRotatef(-90, 1, 0, 0)
+        gluCylinder(_quad, 35, 35, 180, 16, 16)
+        glPopMatrix()
+
+    glPopMatrix()
+
+def update_obstacle(obs, dt):
+    if obs['type'] == 'spinner':
+        obs['rotation'] += 180 * dt
+
+def manage_obstacles(dt):
+    global obstacles
+    obstacles = [o for o in obstacles if o['y'] > player.y - 300]
+    if random.random() < OBSTACLE_SPAWN_RATE * (1 + player.level * 0.1) * dt:
+        obstacles.append(spawn_obstacle())
+
+# --------------- Collectibles ---------------
+def spawn_collectible():
+    types = ['cube', 'sphere', 'cylinder', 'golden_cube', 'golden_sphere', 'golden_cylinder']
+    weights = [30, 30, 30, 3, 3, 4]
+    ctype = random.choices(types, weights=weights)[0]
+    return {
+        'type': ctype,
+        'x': random.uniform(-GRID_LENGTH + WALL_INSET + 50, GRID_LENGTH - WALL_INSET - 50),
+        'y': player.y + random.uniform(200, 1200),
+        'z': random.uniform(25, 120),
+        'rotation': 0,
+        'bob': 0
+    }
+
+def draw_collectible(col):
+    ensure_quad()
+    glPushMatrix()
+    glTranslatef(col['x'], col['y'], col['z'] + math.sin(col['bob']) * 10)
+    glRotatef(col['rotation'], 0, 0, 1)
+
+    if 'golden' in col['type']:
+        glColor3f(1.0, 0.8, 0.0)
+    elif col['type'] == 'cube':
+        glColor3f(0.0, 1.0, 0.0)
+    elif col['type'] == 'sphere':
+        glColor3f(0.0, 0.0, 1.0)
+    elif col['type'] == 'cylinder':
+        glColor3f(1.0, 0.0, 1.0)
+
+    if 'cube' in col['type']:
+        glutSolidCube(30)
+    elif 'sphere' in col['type']:
+        gluSphere(_quad, 18, 12, 12)
+    elif 'cylinder' in col['type']:
+        glRotatef(-90, 1, 0, 0)
+        gluCylinder(_quad, 12, 12, 25, 12, 12)
+
+    glPopMatrix()
+
+def update_collectible(col, dt):
+    col['rotation'] += 120 * dt
+    col['bob'] += 4 * dt
+
+def manage_collectibles(dt):
+    global collectibles
+    collectibles = [c for c in collectibles if c['y'] > player.y - 200]
+    if random.random() < COLLECTIBLE_SPAWN_RATE * dt:
+        collectibles.append(spawn_collectible())
+
+# --------------- Combo helpers ---------------
+def add_combo():
+    global combo_count, combo_timer, score_multiplier, best_combo
+    combo_count += 1
+    best_combo = max(best_combo, combo_count)
+    combo_timer = COMBO_WINDOW
+    steps = combo_count // COMBO_STEP
+    score_multiplier = min(1.0 + 0.5 * steps, MAX_MULTIPLIER)
+
+def decay_combo(dt):
+    global combo_timer, combo_count, score_multiplier
+    if combo_timer > 0:
+        combo_timer -= dt
+        if combo_timer <= 0:
+            combo_count = 0
+            score_multiplier = 1.0
+
+def combo_reset_on_damage():
+    global combo_count, combo_timer, score_multiplier
+    combo_count = 0
+    combo_timer = 0.0
+    score_multiplier = 1.0
+
+def collect_item(col):
+    base_score = 1
+    if power_effects['double_score_time'] > 0:
+        base_score *= 2
+
+    if player.consecutive_collect['type'] == col['type']:
+        player.consecutive_collect['count'] += 1
+        if player.consecutive_collect['count'] >= 2:
+            base_score = max(base_score, 2)
+    else:
+        player.consecutive_collect['type'] = col['type']
+        player.consecutive_collect['count'] = 1
+
+    add_combo()
+    total_score = int(base_score * score_multiplier)
+
+    if col['type'] in ['cube', 'sphere', 'cylinder']:
+        player.score += total_score
+    elif col['type'] == 'golden_cube':
+        player.health = min(100, player.health + 25)
+        player.score += total_score
+    elif col['type'] == 'golden_sphere':
+        power_effects['double_score_time'] = 8.0
+        player.score += total_score
+    elif col['type'] == 'golden_cylinder':
+        power_effects['immune_time'] = 6.0
+        player.score += total_score
+
+# --------------- Collision Detection ---------------
+def end_game():
+    global game_state
+    game_state = 'game_over'
+    add_score_to_board(player.score)
+
+def check_collisions():
+    global boss
+
+    if power_effects['invincible_time'] <= 0 and power_effects['immune_time'] <= 0:
+        took_damage = False
+
+        for enemy in enemies[:]:
+            enemy_radius = enemy['r'] * (1.6 * ENEMY_SCALE if enemy.get('boss') else ENEMY_SCALE)
+            if distance_2d(player.x, player.y, enemy['x'], enemy['y']) < player.radius + enemy_radius:
+                if enemy.get('boss'):
+                    if player.z > 40:
+                        enemy['health'] -= 1
+                        player.vz = 500
+                        add_combo()
+                        player.score += int(20 * score_multiplier)
+                        if enemy['health'] <= 0:
+                            player.score += int(300 * score_multiplier)
+                            enemies.remove(enemy)
+                            if boss is enemy:
+                                boss = None
+                    else:
+                        lose_life(30)
+                        took_damage = True
+                else:
+                    lose_life(20)
+                    took_damage = True
+
+            if took_damage:
+                break
+
+        if not took_damage:
+            for obs in obstacles:
+                if distance_2d(player.x, player.y, obs['x'], obs['y']) < 100:
+                    low_enough = (obs['type'] == 'wall' and player.z < 120) or (obs['type'] == 'spinner' and player.z < 140)
+                    if low_enough:
+                        lose_life(1000)
+                        power_effects['invincible_time'] = 2.0
+                        break
+
+    for col in collectibles[:]:
+        if distance_2d(player.x, player.y, col['x'], col['y']) < 50:
+            collect_item(col)
+            collectibles.remove(col)
+
+def lose_life(damage):
+    player.health -= damage
+    combo_reset_on_damage()
+    if player.health <= 0:
+        player.lives -= 1
+        if player.lives <= 0:
+            end_game()
+        else:
+            respawn_player()
+            power_effects['invincible_time'] = 2.0
+            player.health = 100
+
+def respawn_player():
+    player.x = 0
+    player.y = player.y
+    player.z = 0
+    player.health = 100
+
+# --------------- Game Logic ---------------
+def update_player(dt):
+    if game_state != 'playing':
+        return
+
+    # --------------- Add smooth movement ---------------
+    update_smooth_movement_simple(dt)
+
+    if power_effects['speed_time'] > 0:
+       speed_multiplier = 5.0
+    else:
+       speed_multiplier = 1.0
+
+    player.y += player.speed_forward * speed_multiplier * dt
+    player.distance += player.speed_forward * speed_multiplier * dt
+
+    player.vz += player.gravity * dt
+    player.z += player.vz * dt
+    if player.z <= 0:
+        player.z = 0
+        player.vz = 0
+        player.on_ground = True
+    else:
+        player.on_ground = False
+
+    clamp_to_walls()
+
+    if player.distance >= LEVEL_DISTANCE * player.level:
+        player.level += 1
+
+    for effect in power_effects:
+        if power_effects[effect] > 0:
+            power_effects[effect] -= dt
+    for ability in ability_cooldowns:
+        if ability_cooldowns[ability] > 0:
+            ability_cooldowns[ability] -= dt
+
+def reset_game():
+    global player, enemies, obstacles, collectibles, power_effects
+    global ability_cooldowns, ability_uses, boss, boss_spawned_levels
+    global combo_count, combo_timer, score_multiplier, best_combo, current_movement
+
+    player = Player()
+    player.lives = 3
+    player.health = 100
+    player.score = 0
+    player.level = 1
+
+    enemies = []
+    obstacles = []
+    collectibles = []
+    power_effects = {key: 0 for key in power_effects}
+    ability_cooldowns = {key: 0 for key in ability_cooldowns}
+    ability_uses = {key: 0 for key in ability_uses}
+    boss = None
+    boss_spawned_levels.clear()
+
+    combo_count = 0
+    combo_timer = 0.0
+    score_multiplier = 1.0
+    best_combo = 0
+    
+    # --------------- Reset movement state ---------------
+    current_movement = {'left': 0, 'right': 0, 'forward': 0, 'backward': 0}
+
+# --------------- Main game loop ---------------
+def idle():
+    global _last_time_ms, animation_counter
+    animation_counter += 1  # Replace glutGet(GLUT_ELAPSED_TIME)
+    
+    now = animation_counter * 16  # Simulate milliseconds
+    if _last_time_ms is None:
+        _last_time_ms = now
+    dt = (now - _last_time_ms) / 1000.0
+    _last_time_ms = now
+    dt = min(dt, 0.033)
+
+    if game_state == 'playing':
+        update_player(dt)
+        for enemy in enemies:
+            update_enemy(enemy, dt)
+        manage_enemies(dt)
+        for obs in obstacles:
+            update_obstacle(obs, dt)
+        manage_obstacles(dt)
+        for col in collectibles:
+            update_collectible(col, dt)
+        manage_collectibles(dt)
+        check_collisions()
+        update_daynight(dt)
+        decay_combo(dt)
+
+    glutPostRedisplay()
+
+# --------------- Menu & Screens ---------------
+def draw_menu():
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    begin_2d()
+    glColor3f(1, 1, 1)
+    draw_text(300, 700, "3D TEMPLE RUN GAME", GLUT_BITMAP_TIMES_ROMAN_24)
+    draw_text(350, 650, "Choose Your Player:", GLUT_BITMAP_HELVETICA_18)
+    for i, ptype in enumerate(PLAYER_TYPES):
+        y_pos = 600 - i * 50
+        marker = ">>>" if i == selected_player else "   "
+        draw_text(200, y_pos, f"{marker} {ptype['name']}: {ptype['special'].replace('_', ' ').title()}")
+    draw_text(150, 350, "Collectibles:")
+    draw_text(150, 320, "Cube/Sphere/Cylinder: +1 score (+2 consecutive)")
+    draw_text(150, 290, "Golden Cube: +Health")
+    draw_text(150, 260, "Golden Sphere: Double Score (8s)")
+    draw_text(150, 230, "Golden Cylinder: Enemy Immunity (6s)")
+    draw_text(150, 170, "Boss every 3 levels (jump on it to damage)")
+    draw_text(150, 140, "Combo Meter: chain items to increase multiplier")
+    draw_text(150, 110, "Day/Night Cycle: dynamic sky & tints")
+    draw_text(200, 70,  "Controls:")
+    draw_text(200, 40,  "A/D: Move | W/S: Speed +/- | Space: Jump | Q: Ability | Enter: Start")
+    end_2d()
+    glutSwapBuffers()
+
+def draw_game_over():
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    begin_2d()
+    glColor3f(1,1,1)
+    draw_text(400, 600, "GAME OVER", GLUT_BITMAP_TIMES_ROMAN_24)
+    draw_text(350, 550, f"Final Score: {player.score}")
+    draw_text(350, 520, f"Level Reached: {player.level}")
+    draw_text(350, 490, f"Best Combo: {best_combo}")
+    draw_text(350, 460, f"Your Rank: #{get_player_rank(player.score)}")
+    draw_text(350, 400, "Top Scores:")
+    for i, score in enumerate(scoreboard[:5]):
+        draw_text(350, 370 - i * 30, f"{i+1}. {score}")
+    draw_text(300, 200, "Press R to restart or ESC to menu")
+    end_2d()
+    glutSwapBuffers()
+
+# --------------- HUD (Heads-Up Display) ---------------
+def draw_hud():
+    begin_2d()
+
+    draw_text(10, WINDOW_H - 30, "Lives:")
+    draw_lives(80, WINDOW_H - 25, player.lives)
+
+    glColor3f(1,1,1)
+    draw_text(10, WINDOW_H - 95,  f"Score: {player.score}")
+    draw_text(10, WINDOW_H - 120, f"Level: {player.level}")
+
+    if combo_count > 0:
+        draw_text(10, WINDOW_H - 145, f"Combo: {combo_count} | x{score_multiplier:.1f} | {combo_timer:0.1f}s")
+
+    draw_text(10, WINDOW_H - 170, f"Enemies: {len([e for e in enemies if not e.get('boss')])}")
+    draw_text(10, WINDOW_H - 195, f"Collectibles: {len(collectibles)}")
+
+    if player.consecutive_collect['count'] > 1:
+        draw_text(10, WINDOW_H - 220, f"Consecutive {player.consecutive_collect['type']}: {player.consecutive_collect['count']}x")
+
+    ptype = player.get_type()
+    ability_name = ptype['special'].replace('_', ' ').title()
+    cooldown = ability_cooldowns[ptype['special']]
+    uses = ability_uses[ptype['special']]
+    if cooldown > 0:
+        draw_text(10, WINDOW_H - 245, f"Ability: {ability_name} (CD: {cooldown:.1f}s)")
+    else:
+        draw_text(10, WINDOW_H - 245, f"Ability: {ability_name} (Ready) Uses: {uses}/2")
+
+    y_offset = 270
+    for effect, time_left in power_effects.items():
+        if time_left > 0:
+            effect_name = effect.replace('_', ' ').title()
+            draw_text(10, WINDOW_H - y_offset, f"{effect_name}: {time_left:.1f}s")
+            y_offset += 25
+
+    if boss is not None and boss in enemies:
+        draw_text(WINDOW_W - 220, WINDOW_H - 30, f"BOSS HP: {boss['health']}")
+        draw_text(WINDOW_W - 220, WINDOW_H - 50, f"BOSS AHEAD!")
+
+    end_2d()
+
+# --------------- Master display ---------------
+def showScreen():
+    # Fixed background color instead of dynamic
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+    if game_state == 'menu':
+        draw_menu()
+    elif game_state == 'game_over':
+        draw_game_over()
+    else:
+        glViewport(0, 0, WINDOW_W, WINDOW_H)
+        setupCamera()
+
+        draw_tiles_infinite()
+        draw_side_walls_infinite()
+
+        for enemy in enemies:
+            draw_enemy(enemy)
+        draw_player()
+        for obs in obstacles:
+            draw_obstacle(obs)
+        for col in collectibles:
+            draw_collectible(col)
+
+        draw_hud()
+
+        glutSwapBuffers()
+
+# --------------- Input handling - MODIFIED for smooth movement ---------------
+def keyboard(key, x, y):
+    global game_state, selected_player, current_movement
+    if game_state == 'menu':
+        if key == b'\r':
+            game_state = 'playing'
+            reset_game()
+    elif game_state == 'playing':
+        # Set movement with auto-decay
+        if key in (b'a', b'A'):
+            current_movement['left'] = 30    # Will decay over 30 frames
+        elif key in (b'd', b'D'):
+            current_movement['right'] = 30
+        elif key in (b'w', b'W'):
+            current_movement['forward'] = 200
+        elif key in (b's', b'S'):
+            current_movement['backward'] = 30
+        elif key == b' ' and player.on_ground:
+            ptype = player.get_type()
+            player.vz = ptype['jump_power']
+            player.on_ground = False
+        elif key in (b'q', b'Q'):
+            player.use_ability()
+    elif game_state == 'game_over':
+        if key in (b'r', b'R'):
+            game_state = 'playing'
+            reset_game()
+        elif key == b'\x1b':
+            game_state = 'menu'
+
+    if key == b'\x1b':
+        game_state = 'menu'
+
+def special_down(key, x, y):
+    global selected_player, current_movement
+    if game_state == 'menu':
+        if key == GLUT_KEY_UP:
+            selected_player = (selected_player - 1) % len(PLAYER_TYPES)
+        elif key == GLUT_KEY_DOWN:
+            selected_player = (selected_player + 1) % len(PLAYER_TYPES)
+    elif game_state == 'playing':
+        # Set movement with auto-decay
+        if key == GLUT_KEY_LEFT:
+            current_movement['left'] = 30
+        elif key == GLUT_KEY_RIGHT:
+            current_movement['right'] = 30
+        elif key == GLUT_KEY_UP and player.on_ground:
+            ptype = player.get_type()
+            player.vz = ptype['jump_power']
+            player.on_ground = False
+        elif key == GLUT_KEY_DOWN:
+            current_movement['backward'] = 30
+
+# --------------- Dummy mouse function to match template ---------------
+def mouseListener(button, state, x, y):
+    pass
+
+# --------------- Main function ---------------
+def main():
+    load_scoreboard()
+
+    glutInit()
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+    glutInitWindowSize(WINDOW_W, WINDOW_H)
+    glutInitWindowPosition(0, 0)
+    glutCreateWindow(b"3D Temple Run Style Game")
+
+    glutDisplayFunc(showScreen)
+    glutIdleFunc(idle)
+    glutKeyboardFunc(keyboard)
+    glutSpecialFunc(special_down)
+    glutMouseFunc(mouseListener)
+
+    glutMainLoop()
+
+if __name__ == "__main__":
+    main()
